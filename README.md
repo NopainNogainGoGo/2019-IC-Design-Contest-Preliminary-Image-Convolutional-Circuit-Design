@@ -1,110 +1,32 @@
-# CONV Module
+以下為我寫這題學到的一些東西：
 
-## 📖 Overview
+### 1. 定點數運算與 Bias 對齊 (Q-Format)
 
-The **`CONV`** module is a Verilog hardware design that performs **convolution + ReLU + max pooling** operations on grayscale image data.
+這是硬體運算中最核心的部分，強調在進行加法前必須手動對齊小數點（Binary Point）。
+**小數點對齊原理**：硬體加法器預設只會對齊最低位元（LSB）。若直接將 Input (e.g., Q8.8) 與 Bias (e.g., Q4.16) 相加，數學結果會完全錯誤 。
+**Bias 擴展步驟**：假設累加器為 40-bit (Q12.28)，而原始 Bias 為 20-bit (Q4.16)，需要進行轉換 ：
+**符號擴展 (Sign Extension)**：在左側（高位）補上符號位元（正數補 0，負數補 1）以補齊整數部分 。
+**補零 (Zero Padding)**：在右側（低位）補 0 以對齊小數精度 。
+**Verilog 注意事項**：運算中若混合 Signed 與 Unsigned，Verilog 會將全體視為 Unsigned 。
 
-This module simulates the first two layers of a **Convolutional Neural Network (CNN)**:
 
-1. **Convolution + Bias + ReLU** → writes results into **Layer 0 (SRAM)**
-2. **MaxPooling (stride=2)** → writes results into **Layer 1 (SRAM)**
 
-It uses a **finite state machine (FSM)** to control the flow of convolution, ReLU activation, pooling, and memory operations.
+### 2. 卷積運算 (Convolution) 實作細節
+**定址與狀態控制**：使用 X, Y 計數器從 (0,0) 數到 63。當計數器溢位至 64 (`1_000000`) 時歸零，並以此信號判斷 FSM 狀態跳轉 。
+ **Zero Padding 處理**：
+透過 `Counter_kaddr` 產生地址給 Testbench 抓取資料 (`idata`) 。
+使用 `idata_tmp` 暫存資料，若座標位於邊界（最外圍），則強制填入 0 (Zero Padding) 。
+**時序控制**：Kernel 的計數器是組合電路（當下更新），而讀取地址 `iaddr` 是序向電路（會慢一個 Cycle 更新），需注意此時序差 。
+**運算優化**：不需使用二維陣列儲存資料，讀取到的 `idata` 直接與 Kernel 相乘並累加至 `conv_sum`。前 9 次進行卷積累加，第 10 次加上 Bias 。
 
----
 
-## ⚙️ Features
+### 3. 後處理：Rounding 與 ReLU
+**四捨五入 (Rounding)**：題目要求「0 捨 1 入」。實作方式是截取累加結果的高位 `conv_sum[35:16]` 並加上第 15 位 (`conv_sum[15]`) 來進位 。
+**ReLU 激活函數**：檢查符號位 (MSB)。若 `conv_sum[39]` 為 1（負數），輸出 0；否則輸出原始計算結果 。
 
-* **Convolution with 3×3 Kernel** (with predefined weights `K0_0` to `K0_8`)
-* **Bias addition**
-* **Zero padding** at image boundaries
-* **ReLU activation** (negative values → 0)
-* **2×2 MaxPooling (stride=2)**
-* **SRAM interface** for storing intermediate results
-* **FSM-based control** for modular computation
 
----
 
-## 🔧 I/O Ports
-
-| Signal     | Dir | Width | Description             |
-| ---------- | --- | ----- | ----------------------- |
-| `clk`      | in  | 1     | System clock            |
-| `reset`    | in  | 1     | Reset signal            |
-| `busy`     | out | 1     | Module busy flag        |
-| `ready`    | in  | 1     | Start signal            |
-| `iaddr`    | out | 12    | Input image address     |
-| `idata`    | in  | 20    | Input image data        |
-| `cwr`      | out | 1     | Write enable for SRAM   |
-| `caddr_wr` | out | 12    | Write address for SRAM  |
-| `cdata_wr` | out | 20    | Data to write into SRAM |
-| `crd`      | out | 1     | Read enable for SRAM    |
-| `caddr_rd` | out | 12    | Read address for SRAM   |
-| `cdata_rd` | in  | 20    | Data read from SRAM     |
-| `csel`     | out | 3     | SRAM bank select        |
-
----
-
-## 🏗️ FSM States
-
-| State       | Code | Description                                  |
-| ----------- | ---- | -------------------------------------------- |
-| `IDLE`      | 000  | Wait for `ready` signal                      |
-| `READ_CONV` | 001  | Read pixels & compute convolution            |
-| `WRITE_L0`  | 010  | Write convolution + ReLU result into Layer 0 |
-| `DELAY1`    | 011  | Transition delay                             |
-| `READ_L0`   | 100  | Read data from Layer 0 for pooling           |
-| `WRITE_L1`  | 101  | Write pooled results into Layer 1            |
-| `DELAY2`    | 110  | Transition delay                             |
-| `FINISH`    | 111  | Processing complete                          |
-
----
-
-## 🧮 Internal Logic
-
-* **Convolution Accumulator (`conv_sum`)**
-
-  * 9 MAC operations for kernel \* pixel values
-  * Bias is added on the 10th cycle
-  * Final result rounded and passed through **ReLU**
-
-* **Pooling (`current_max`)**
-
-  * Reads 2×2 block from Layer 0
-  * Selects maximum value and writes to Layer 1
-
-* **Coordinate counters**
-
-  * `(x, y)` for convolution pixel scanning (64×64 image)
-  * `(L1_x, L1_y)` for pooling (stride=2 → 32×32 output)
-
----
-
-## 📐 Memory Mapping
-
-* **Input image**: 64×64 pixels
-* **Layer 0 (Convolution output)**: 64×64 pixels stored in `SRAM[0]`
-* **Layer 1 (Pooling output)**: 32×32 pixels stored in `SRAM[1]`
-
----
-
-## 🚀 Usage
-
-1. Set `reset = 1` → Initialize
-2. Set `ready = 1` → Start computation
-3. Wait until `busy = 0` → Computation finished
-4. Read results from SRAM:
-
-   * **Layer 0** (convolution + ReLU results)
-   * **Layer 1** (pooled results)
-
----
-
-## 🗂️ File Structure
-
-```
-.
-├── CONV.v        # Verilog module (this file)
-├── README.md     # Documentation
-└── testbench/    # (Optional) testbenches for simulation
-```
+### 4. 最大池化 (Max Pooling - Layer 1)
+**流程**：從 Layer 0 記憶體讀取卷積後的資料，同樣使用 X, Y 定址 。
+**比較邏輯**：使用比較器更新最大值。若讀取到的 `cdata_rd` 大於 `current_max`，則更新 `current_max` 。
+**寫回**：比較完 4 筆資料後，將最終的 `current_max` 寫入 SRAM，完成池化運算 。
