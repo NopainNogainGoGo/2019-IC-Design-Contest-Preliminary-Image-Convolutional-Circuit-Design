@@ -17,16 +17,16 @@ module CONV(
 //==============================
 // Kernel 參數設定
 //==============================
-parameter bias = 40'h0013100000;   // 偏移值 (bias)
-parameter K0_0 = 20'h0A89E;        // Kernel[0][0]
-parameter K0_1 = 20'h092D5;        // Kernel[0][1]
-parameter K0_2 = 20'h06D43;        // Kernel[0][2]
-parameter K0_3 = 20'h01004;        // Kernel[1][0]
-parameter K0_4 = 20'hF8F71;        // Kernel[1][1]
-parameter K0_5 = 20'hF6E54;        // Kernel[1][2]
-parameter K0_6 = 20'hFA6D7;        // Kernel[2][0]
-parameter K0_7 = 20'hFC834;        // Kernel[2][1]
-parameter K0_8 = 20'hFAC19;        // Kernel[2][2]
+parameter signed bias = 40'h0013100000;   // 偏移值 (bias)
+parameter signed K0_0 = 20'h0A89E;        // Kernel[0][0]
+parameter signed K0_1 = 20'h092D5;        // Kernel[0][1]
+parameter signed K0_2 = 20'h06D43;        // Kernel[0][2]
+parameter signed K0_3 = 20'h01004;        // Kernel[1][0]
+parameter signed K0_4 = 20'hF8F71;        // Kernel[1][1]
+parameter signed K0_5 = 20'hF6E54;        // Kernel[1][2]
+parameter signed K0_6 = 20'hFA6D7;        // Kernel[2][0]
+parameter signed K0_7 = 20'hFC834;        // Kernel[2][1]
+parameter signed K0_8 = 20'hFAC19;        // Kernel[2][2]
 
 //==============================
 // 有限狀態機 FSM 狀態定義
@@ -57,7 +57,7 @@ reg signed [19:0] idata_tmp;           // idata輸入做 Zero padding 後暫存�
 wire signed [39:0] data_conv;
 wire signed [19:0] conv_result;
 assign data_conv = Kernel * idata_tmp;             // 乘上Kernel值
-assign conv_result[19:0] = conv_sum[35:16] + conv_sum[15];  // 取捨與rounding後的最終值
+assign conv_result[19:0] = conv_sum[35:16] + conv_sum[15];  // rounding
 
 //==============================
 // 根據 counter_kdata 對應 Kernel 值
@@ -104,17 +104,13 @@ always @(*) begin
 	endcase
 end
 
-//==============================
-// 3. ol
-//==============================
 
 //=======READ_CONV=======
 // 控制輸入記憶體讀取地址 iaddr（依據 filter 位置）
 always@(posedge clk or posedge reset) begin
 	if(reset) begin 
 		iaddr <= 12'd0;
-	end
-	else if(current_state == READ_CONV) begin//指示欲索取哪個灰階圖像像素(pixel)的位址 用x,y去定址
+	end else if(current_state == READ_CONV) begin//指示欲索取哪個灰階圖像像素(pixel)的位址 用x,y去定址
 		case(counter_kaddr)
 			4'd0: iaddr <= (y-1)*64 + x-1;
 			4'd1: iaddr <= (y-1)*64 + x;
@@ -137,7 +133,7 @@ always@(posedge clk or posedge reset) begin
 	else if(current_state == READ_CONV) 
 		counter_kaddr <= counter_kaddr + 4'd1;
 	else 
-		counter_kaddr <= counter_kaddr; // 最後的 else 不要賦新值 這樣Design Complier可以幫忙做clk gating
+		counter_kaddr <= counter_kaddr;
 end
 
 // idata_tmp 控制：根據邊界情況做 zero padding
@@ -159,6 +155,31 @@ always@(posedge clk or posedge reset) begin
 		endcase
 	end 
 end
+
+/*
+
+Case: Top Row (4'd0, 4'd1, 4'd2)
+Condition: y == 0
+Logic: If your current center pixel is on the very first row ($y=0$), 
+there is no row above it. Therefore, any attempt to read pixels for the "Top" positions must return 0.
+
+Case: Left Column (4'd0, 4'd3, 4'd6)
+Condition: x == 0
+Logic: If your current pixel is on the far left edge ($x=0$), 
+there is no pixel to its left. Positions like "Mid-Left" must return 0.
+
+Case: Right Column (4'd2, 4'd5, 4'd8)
+Condition: x == 63
+Logic: Since the image width is 64 pixels, the max index is 63. 
+If $x=63$, any "Right" neighbor is out of bounds.
+
+Case: Bottom Row (4'd6, 4'd7, 4'd8)
+Condition: y == 63
+Logic: If the center is on the last row ($y=63$), there is no "Bottom" neighbor.
+
+*/
+
+
 
 // 卷積累加器：前9次做累加，第10次加上 bias
 always@(posedge clk or posedge reset) begin
@@ -257,18 +278,14 @@ always@(posedge clk or posedge reset) begin
 	if(reset) begin
 		cdata_wr <= 20'd0;
 		current_max <= 20'd0; 
-	end
-	else begin
+	end else begin
 		case(current_state)
-			WRITE_L0: begin
-				// ReLU 激活函數：負數變0，正數保持
+			WRITE_L0: // ReLU 激活函數：負數變0，正數保持
 				cdata_wr <= (conv_sum[39]) ? 20'd0 : conv_result;
-			end
-			
-			READ_L0: begin
-				// MaxPooling：持續更新最大值
-				if(counter_layer1 == 3'd1) begin
-					current_max <= cdata_rd; // 第一次讀取
+
+			READ_L0: begin				
+				if(counter_layer1 == 3'd1) begin	// MaxPooling：持續更新最大值
+					current_max <= cdata_rd; 		// 第一次讀取
 				end else begin
 					current_max <= (cdata_rd > current_max) ? cdata_rd : current_max;
 				end
@@ -277,7 +294,7 @@ always@(posedge clk or posedge reset) begin
 			WRITE_L1: begin
 				// 寫入 MaxPooling 結果並重置
 				cdata_wr <= current_max;
-				current_max <= 20'h80000; // 重置為最小值
+				current_max <= 20'h00000; // 重置為最小值
 			end
 			
 			default: begin
@@ -296,10 +313,8 @@ always@(posedge clk or posedge reset) begin
 	if(reset) begin
 		x <= 6'd0; 
 		y <= 6'd0;
-	end
-	else if(current_state == WRITE_L0) begin
-		// better {y, x} <= {y, x} + 12'd1;
-		if(x == 6'd63) begin
+	end else if(current_state == WRITE_L0) begin
+		if(x == 6'd63) begin  
 			x <= 6'd0;
 			y <= y + 6'd1;
 		end else begin
@@ -313,8 +328,7 @@ always@(posedge clk or posedge reset) begin
 	if(reset) begin
 		L1_x <= 6'd0; 
 		L1_y <= 6'd0;
-	end
-	else if(current_state == WRITE_L1) begin
+	end else if(current_state == WRITE_L1) begin
 		if(L1_x == 6'd62) begin
 			L1_x <= 0;
 			L1_y <= L1_y + 2;
